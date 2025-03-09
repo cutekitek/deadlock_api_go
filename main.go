@@ -1,82 +1,21 @@
 package main
 
 import (
+	api "deadlock_analyzer/client"
 	"deadlock_analyzer/proto/gc/deadlock"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/0xAozora/go-steam"
-	"github.com/0xAozora/go-steam/protocol"
-	"github.com/0xAozora/go-steam/protocol/gamecoordinator"
 	"github.com/0xAozora/go-steam/protocol/protobuf"
-	"google.golang.org/protobuf/proto"
+	"gopkg.in/yaml.v3"
 )
 
-const AppId = 1422450
 
-type handler struct{
-	Client  *steam.Client 
-	Details *steam.LogOnDetails
-}
 
-func (h *handler) HandleGCPacket(packet *gamecoordinator.GCPacket) {
-	if packet.AppId != AppId {
-		return
-	}
-	if msg, ok := deadlock.EGCCitadelClientMessages_name[int32(packet.MsgType)]; ok{
-		fmt.Println("Deadlock client message:",msg)
-		
-	} else if msg, ok := deadlock.EGCCitadelServerMessages_name[int32(packet.MsgType)]; ok {
-		fmt.Println("Deadlock server message:",msg)
-	} else {
-		fmt.Println("Unknown message id:", packet.MsgType)
-	}
-}
-
-func (h *handler) HandlePacket(p *protocol.Packet) {
-	fmt.Printf("Received packet: %+v\n", p)
-}
-
-func (h *handler) HandleDeadlockClientMsg(packet *gamecoordinator.GCPacket) {
-	switch deadlock.EGCCitadelClientMessages(packet.MsgType) {
-	case deadlock.EGCCitadelClientMessages_k_EMsgClientToGCGetAccountStatsResponse:
-		stats := &deadlock.CMsgClientToGCGetAccountStatsResponse{}
-		err := proto.Unmarshal(packet.Body, stats)
-		if err != nil{
-			panic(err)
-		}
-		fmt.Println("status", deadlock.CMsgClientToGCGetAccountStatsResponse_EResult_name[int32(*stats.Result)])
-
-		if stats.Stats != nil{
-			for _, h := range stats.Stats.Stats {
-				fmt.Println(*h.HeroId, h.StatId, h.TotalValue)
-			}
-		}
-	}
-}
-
-func (h *handler) HandleEvent(event interface{}) {
-	switch e := event.(type) {
-	case *steam.ConnectedEvent:
-		h.Client.Auth.LogOn(h.Details)
-	case *steam.LoggedOnEvent:
-		log.Printf("Logged on (%v) with SteamId %v and account flags %v", e.Result, e.ClientSteamId, e.AccountFlags)
-		h.Client.GC.SetGamesPlayed(AppId)
-		time.Sleep(time.Millisecond*500)
-		accId := h.Client.SteamId().GetAccountId()
-		h.Client.GC.Write(gamecoordinator.NewGCMsgProtobuf(AppId, uint32(deadlock.EGCCitadelClientMessages_k_EMsgClientToGCGetAccountStats), &deadlock.CMsgClientToGCGetAccountStats{
-			AccountId: &accId,
-		}))
-	case *steam.LoginKeyEvent:
-		log.Printf("New LoginKey: %v\n", e.LoginKey)
-	case *steam.LogOnFailedEvent:
-		log.Printf("Failed to log on (%v)", e.Result)
-	}
-
-} 
-
-type ConsoleAuthentficator struct {}
+type ConsoleAuthentficator struct{}
 
 func (c *ConsoleAuthentficator) GetCode(protobuf.EAuthSessionGuardType) string {
 	var code string
@@ -85,15 +24,62 @@ func (c *ConsoleAuthentficator) GetCode(protobuf.EAuthSessionGuardType) string {
 	return code
 }
 
+type Config struct {
+	Username string `yaml:"username"`
+	AccessToken  string `yaml:"access_token"`
+	RefreshToken string `yaml:"refresh_token"`
+	GuardData    string `yaml:"guard_data"`
+}
+
+func loadConfig() (*Config, error) {
+	configFile, err := os.Open("config.yml")
+	if err != nil {
+		return nil, err
+	}
+	defer configFile.Close()
+
+	config := &Config{}
+	err = yaml.NewDecoder(configFile).Decode(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
 func main() {
-	details := &steam.LogOnDetails{}
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	details := &steam.LogOnDetails{
+		Username: config.Username,
+		AccessToken:  config.AccessToken,
+		RefreshToken: config.RefreshToken,
+		GuardData:    config.GuardData,
+	}
+
 	client := steam.NewClient()
 	client.Auth.Authenticator = &ConsoleAuthentficator{}
-	h := &handler{Details: details, Client: client}
-	client.RegisterPacketHandler(h)
-	client.GC.RegisterPacketHandler(h)
-	client.Connect()
-	for evt := range client.Events() {
-		h.HandleEvent(evt)
+	
+	dlClient := api.NewHandler(client, details)
+	if err := dlClient.Connect(); err != nil{
+		panic(err)
+	}
+	steamId := client.SteamId().GetAccountId()
+	dlClient.GetAccountStats(&deadlock.CMsgClientToGCGetAccountStats{
+		AccountId: &steamId,
+	})
+	for evt := range dlClient.Events(){
+		switch e := evt.(type) {
+		case api.GetActiveMatchesResponse:
+			fmt.Println("Active matches:", len(e.ActiveMatches))
+			time.Sleep(time.Millisecond * 300)
+			dlClient.GetActiveMatches(&deadlock.CMsgClientToGCGetActiveMatches{})
+
+		case api.GetAccountStatsResponse:
+			fmt.Println("Stats:", e.Stats.Stats)
+		}
 	}
 }
